@@ -1,7 +1,6 @@
 import { Annotation, StateGraph, START, END } from "@langchain/langgraph";
 import { ChatOllama } from "@langchain/ollama";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-export const runtime = "nodejs";
 type Brand={id:string;name:string;niche:string;audience:string;identity:unknown};
 type Account={id:string;brand_id:string;platform:string;handle:string;retrieval_status:string};
 type Snapshot={account_id:string;observed_at:string;source:string;followers:number|null;published_count:number|null;lifetime_views:number|null};
