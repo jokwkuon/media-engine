@@ -18,3 +18,7 @@ Database migration/advisors verified remotely. UI build, lint and browser tests 
 ## Next
 
 Session refresh/revocation, full brand editing, server-authorized job transitions, budget enforcement, n8n exports, provider adapters, approval enforcement and publishing. Do not activate paid calls or publishing without authorization.
+
+## FitWithJim analytics update
+
+Applied social analytics migration 20261127021028 and registered FitWithJim and DailyGym under the sole confirmed Auth user. Five social accounts and four public profile snapshots imported from Volume (November 26, 2026 local date, approximate capture time). TikTok retrieval unavailable. Snapshot table is owner-read-only for authenticated users. Dashboard shows latest observations by brand; reload reads stored data only. Official OAuth, historical posts, date-range deltas, advertising and website attribution are pending. No live API syncing. Security advisor now reports leaked password protection disabled; no table-policy finding reported. UI changes not built or browser-tested remotely.
