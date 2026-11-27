@@ -2,14 +2,15 @@ import { Annotation, StateGraph, START, END } from "@langchain/langgraph";
 import { ChatOllama } from "@langchain/ollama";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 type Brand={id:string;name:string;niche:string;audience:string;identity:unknown};
-type Account={id:string;brand_id:string;platform:string;handle:string;retrieval_status:string};
+type Account={id:string;brand_id:string;platform:string;handle:string;retrieval_status:string;content_style:string;content_goal:string};
 type Snapshot={account_id:string;observed_at:string;source:string;followers:number|null;published_count:number|null;lifetime_views:number|null};
-type Context={brands:Brand[];accounts:Array<Account & {snapshot:Snapshot|null}>};
+type Post={account_id:string;title:string;format:string;campaign:string;status:string;planned_date:string|null;views:number|null;likes:number|null;comments:number|null;shares:number|null;saves:number|null;follows:number|null;clicks:number|null;conversions:number|null;metrics_observed_at:string|null};
+type Context={brands:Brand[];accounts:Array<Account & {snapshot:Snapshot|null}>;posts:Post[]};
 const State=Annotation.Root({question:Annotation<string>(),context:Annotation<Context>(),evidence:Annotation<string>(),answer:Annotation<string>()});
 const graph=new StateGraph(State)
  .addNode("analytics", async (s)=>{
  const rows=s.context.accounts;const known=rows.filter(a=>a.snapshot?.followers!=null);
- return {evidence:JSON.stringify({brands:s.context.brands,accounts:rows,reportedFollowers:known.length?known.reduce((n,a)=>n+(a.snapshot?.followers??0),0):null,followerCoverage:known.length,totalAccounts:rows.length})};
+ return {evidence:JSON.stringify({brands:s.context.brands,accounts:rows,reportedFollowers:known.length?known.reduce((n,a)=>n+(a.snapshot?.followers??0),0):null,followerCoverage:known.length,totalAccounts:rows.length,posts:s.context.posts,postDataScope:"Up to 100 recent records. Drafts are plans, not published content. Null metrics are unknown. Compare only measured posts and distinguish platforms."})};
  })
  .addNode("strategy",async(s)=>{
  const model=new ChatOllama({baseUrl:"http://127.0.0.1:11434",model:process.env.OLLAMA_MODEL||"qwen3:4b",temperature:0.2,maxRetries:0});
@@ -29,9 +30,10 @@ export async function POST(req:Request){
  async function read<T>(path:string):Promise<T>{const r=await fetch(url+path,{headers,cache:"no-store",signal:AbortSignal.timeout(10000)});if(!r.ok)throw Error("Data unavailable");return r.json();}
  const brands=await read<Brand[]>("/rest/v1/brands?select=id,name,niche,audience,identity"+(filter==="all"?"":"&id=eq."+filter)+"&limit=100");
  if(filter!=="all"&&!brands.length)return Response.json({error:"Brand not found."},{status:404});
- const accounts=await read<Account[]>("/rest/v1/social_accounts?select=id,brand_id,platform,handle,retrieval_status"+(filter==="all"?"":"&brand_id=eq."+filter)+"&limit=100");
+ const accounts=await read<Account[]>("/rest/v1/social_accounts?select=id,brand_id,platform,handle,retrieval_status,content_style,content_goal"+(filter==="all"?"":"&brand_id=eq."+filter)+"&limit=100");
  const snapshots=await Promise.all(accounts.map(a=>read<Snapshot[]>("/rest/v1/account_snapshots?select=account_id,observed_at,source,followers,published_count,lifetime_views&account_id=eq."+a.id+"&order=observed_at.desc,id.desc&limit=1")));
- const context={brands,accounts:accounts.map((a,i)=>({...a,snapshot:snapshots[i][0]??null}))};
+ const posts=accounts.length?await read<Post[]>("/rest/v1/marketing_posts?select=account_id,title,format,campaign,status,planned_date,views,likes,comments,shares,saves,follows,clicks,conversions,metrics_observed_at&account_id=in.("+accounts.map(a=>a.id).join(",")+")&order=created_at.desc&limit=100"):[];
+ const context={brands,accounts:accounts.map((a,i)=>({...a,snapshot:snapshots[i][0]??null})),posts};
  const output=await graph.invoke({question:body.question.trim(),context,evidence:"",answer:""});
  return Response.json({answer:output.answer,accounts:accounts.length,provider:"local Ollama",model:process.env.OLLAMA_MODEL||"qwen3:4b"});
  }catch{return Response.json({error:"Analysis failed. Verify Ollama is running, the model is downloaded, and Supabase is reachable."},{status:503});}
