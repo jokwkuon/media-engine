@@ -8,11 +8,12 @@ type Field=typeof fields[number];
 const format=(n:number|null)=>n===null?"—":n.toLocaleString();
 const compact=(n:number)=>Intl.NumberFormat("en",{notation:"compact",maximumFractionDigits:1}).format(n);
 const dayLabel=(s:string)=>new Date(s+"T12:00:00Z").toLocaleDateString("en",{month:"short",day:"numeric",timeZone:"UTC"});
-function seriesChart({data,cumulative=false}:{data:{day:string;value:number}[];cumulative?:boolean}){
+function SeriesChart({data,cumulative=false}:{data:{day:string;value:number}[];cumulative?:boolean}){
  if(!data.length)return <div className="chart-empty">No measured views in this period.</div>;
  let total=0;const points=data.map(d=>({day:d.day,value:cumulative?(total+=d.value):d.value}));
  const max=Math.max(...points.map(d=>d.value),1),w=640,h=180,left=48,right=18,top=18,bottom=35;
- const x=(i:number)=>left+(points.length===1?(w-left-right)/2:i/(points.length-1)*(w-left-right));
+ const first=Date.parse(points[0].day),last=Date.parse(points[points.length-1].day);
+ const x=(i:number)=>left+(first===last?(w-left-right)/2:(Date.parse(points[i].day)-first)/(last-first)*(w-left-right));
  const y=(n:number)=>top+(1-n/max)*(h-top-bottom);
  const line=points.map((p,i)=>x(i)+","+y(p.value)).join(" ");
  return <svg className="analytics-chart" viewBox={`0 0 ${w} ${h}`} role="img" aria-label={cumulative?"Cumulative measured views by publication date":"Measured views grouped by publication date"}>
@@ -20,16 +21,16 @@ function seriesChart({data,cumulative=false}:{data:{day:string;value:number}[];c
  {cumulative&&points.length>1&&<polygon points={`${x(0)},${y(0)} ${line} ${x(points.length-1)},${y(0)}`} fill="var(--accent-soft)"/>}
  {points.length>1&&<polyline points={line} fill="none" stroke="var(--accent)" strokeWidth="2.5" strokeLinejoin="round"/>}
  {points.map((p,i)=><circle key={p.day} cx={x(i)} cy={y(p.value)} r={3.5} fill="var(--accent)"><title>{dayLabel(p.day)}: {format(p.value)} views</title></circle>)}
- {points.map((p,i)=>(i===0||i===points.length-1||points.length<=5)&&<text key={p.day} x={x(i)} y={h-10} textAnchor="middle">{dayLabel(p.day)}</text>)}
+ {points.map((p,i)=>(i===0||i===points.length-1||(points.length<=5&&i>0&&x(i)-x(i-1)>60&&x(points.length-1)-x(i)>60))&&<text key={p.day} x={x(i)} y={h-10} textAnchor="middle">{dayLabel(p.day)}</text>)}
  </svg>
 }
-const SeriesChart=seriesChart;
+
 export default function Performance({token,brands,accounts,brandId,onBrand}:{token:string;brands:Brand[];accounts:Account[];brandId:string;onBrand:(id:string)=>void}){
  const [posts,setPosts]=useState<Post[]>([]),[error,setError]=useState(""),[loading,setLoading]=useState(true),[reload,setReload]=useState(0),[period,setPeriod]=useState(30),[accountId,setAccountId]=useState("all"),[sort,setSort]=useState<Field|"published_at">("views"),[ascending,setAscending]=useState(false);
  useEffect(()=>{let live=true;const base=process.env.NEXT_PUBLIC_SUPABASE_URL,key=process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;if(!base||!key)return;
  fetch(base+"/rest/v1/marketing_posts?select=id,account_id,title,format,post_url,published_at,planned_date,status,views,likes,comments,shares,metrics_observed_at&status=eq.published&order=published_at.desc,id.asc&limit=1000",{headers:{apikey:key,Authorization:"Bearer "+token},cache:"no-store"}).then(async r=>{if(!r.ok)throw Error("Unable to retrieve post performance.");return r.json()}).then(v=>{if(live){setPosts(v);setError("");setLoading(false)}}).catch(e=>{if(live){setError(e.message);setLoading(false)}});return()=>{live=false}},[token,reload]);
  const available=accounts.filter(a=>brandId==="all"||a.brand_id===brandId);
- const visible=useMemo(()=>{const allowed=new Set(accounts.filter(a=>brandId==="all"||a.brand_id===brandId).map(a=>a.id));const cutoff=new Date();cutoff.setDate(cutoff.getDate()-period);return posts.filter(p=>allowed.has(p.account_id)&&(accountId==="all"||p.account_id===accountId)&&(!period||!!p.published_at&&Date.parse(p.published_at)>=cutoff.getTime()));},[accounts,brandId,accountId,period,posts]);
+ const visible=useMemo(()=>{const allowed=new Set(accounts.filter(a=>brandId==="all"||a.brand_id===brandId).map(a=>a.id));const cutoff=new Date();cutoff.setDate(cutoff.getDate()-period);return posts.filter(p=>allowed.has(p.account_id)&&(accountId==="all"||p.account_id===accountId)&&(!period||!!p.published_at&&Date.parse(p.published_at)>=cutoff.getTime()&&Date.parse(p.published_at)<=Date.now()));},[accounts,brandId,accountId,period,posts]);
  const values=fields.map(f=>{const measured=visible.filter(p=>p[f]!=null);return {f,total:measured.length?measured.reduce((n,p)=>n+(p[f]??0),0):null,count:measured.length}});
  const byDay=new Map<string,number>();for(const p of visible){if(p.views===null||!p.published_at)continue;const day=p.published_at.slice(0,10);byDay.set(day,(byDay.get(day)??0)+p.views);}
  const series=Array.from(byDay,([day,value])=>({day,value})).sort((a,b)=>a.day.localeCompare(b.day));
