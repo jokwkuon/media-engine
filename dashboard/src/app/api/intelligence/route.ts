@@ -17,7 +17,7 @@ const proposalFields=["accountId","title","format","plannedDate","hook","outline
 const fieldLimit=(k:typeof proposalFields[number])=>k==="title"?200:k==="outline"?900:400;
 function proposalSchema(context:Context,count:number){
  const properties=Object.fromEntries(proposalFields.map(k=>[k,{type:"string",minLength:1,maxLength:fieldLimit(k)}]));
- return {type:"object",additionalProperties:false,required:["proposals"],properties:{proposals:{type:"array",minItems:count,maxItems:count,items:{type:"object",additionalProperties:false,required:[...proposalFields],properties:{...properties,accountId:{type:"string",enum:context.accounts.map(a=>a.id)},format:{type:"string",enum:[...formats]},plannedDate:{type:"string",pattern:"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}}}}}};
+ return {type:"object",additionalProperties:false,required:["proposals"],properties:{proposals:{type:"array",minItems:count,maxItems:count,items:{type:"object",additionalProperties:false,required:[...proposalFields],properties:{...properties,accountId:{type:"string",enum:context.accounts.slice(0,12).map(a=>a.id)},format:{type:"string",enum:[...formats]},plannedDate:{type:"string",pattern:"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}}}}}};
 }
 async function ask(system:string,payload:unknown,schema?:ReturnType<typeof proposalSchema>){
  const model=new ChatOllama({baseUrl:"http://127.0.0.1:11434",model:process.env.OLLAMA_MODEL||"qwen3:4b",temperature:0.2,maxRetries:0,numPredict:schema?3000:2200,numCtx:8192,think:false,...(schema?{format:schema}:{})});
@@ -111,8 +111,10 @@ const graph=new StateGraph(State)
  return {answer,proposals,planningStatus,steps:[...s.steps,...attempts,{name:"Content planner + deterministic validation (total)",durationMs:Date.now()-t}]};
  })
  .addNode("reviewer",async(s)=>{
- const t=Date.now(),review=await ask(guard+"You are a quality reviewer. Review the proposed plan against the stored evidence. Flag unsupported numerical claims, genuinely duplicated creative execution, vague hooks, weak production direction, account mismatch, CTA/metric mismatch, unsafe fitness claims, and misleading product promises. Reusing a topic, KPI or CTA is NOT inherently a flaw; repeated conversion goals can be useful for experiments. Cite specific proposal numbers and distinguish issues from preferences. Do not reproduce the proposal. Start with REVISE if there is a material issue, otherwise PASS. Give at most five short actionable findings. This is advisory, not approval.",{question:s.question,evidence:JSON.parse(s.evidence),proposal:s.answer});
+ const t=Date.now();
+ try{const review=await ask(guard+"You are a quality reviewer. Review the proposed plan against the stored evidence. Flag unsupported numerical claims, genuinely duplicated creative execution, vague hooks, weak production direction, account mismatch, CTA/metric mismatch, unsafe fitness claims, and misleading product promises. Reusing a topic, KPI or CTA is NOT inherently a flaw; repeated conversion goals can be useful for experiments. Cite specific proposal numbers and distinguish issues from preferences. Do not reproduce the proposal. Start with REVISE if there is a material issue, otherwise PASS. Give at most five short actionable findings. This is advisory, not approval.",{question:s.question,evidence:JSON.parse(s.evidence),proposal:s.answer});
  return {review,steps:[...s.steps,{name:s.revisionAttempted?"Final quality review":"Initial quality review",durationMs:Date.now()-t}]};
+ }catch{ return {review:"REVIEW UNAVAILABLE — the automated quality review did not complete. The structurally validated drafts are retained, but their content needs manual review before approval.",steps:[...s.steps,{name:"Quality review unavailable",durationMs:Date.now()-t}]}; }
  })
  .addNode("revise",async(s)=>{
  const t=Date.now();
@@ -129,7 +131,7 @@ const graph=new StateGraph(State)
  .addEdge(START,"analytics")
  .addConditionalEdges("analytics",s=>s.mode==="planning"?"planner":"strategy")
  .addEdge("strategy",END).addEdge("planner","reviewer")
- .addConditionalEdges("reviewer",s=>!s.revisionAttempted&&!/^PASS\b/i.test(s.review.trim())?"revise":END)
+ .addConditionalEdges("reviewer",s=>!s.revisionAttempted&&!/^(PASS\b|REVIEW UNAVAILABLE)/i.test(s.review.trim())?"revise":END)
  .addConditionalEdges("revise",s=>s.revisionStatus.startsWith("Revised proposals")?"reviewer":END).compile();
 export async function POST(req:Request){
  const auth=req.headers.get("authorization");const url=process.env.NEXT_PUBLIC_SUPABASE_URL;const key=process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
@@ -156,5 +158,5 @@ export async function POST(req:Request){
  const published=posts.filter(p=>p.status==="published");
  const evidenceSummary={competitorRecords:competitors.length,competitorRecordsInPrompt:Math.min(12,competitors.length),competitorNames:Array.from(new Set(competitors.map(c=>c.competitor))),brands:brands.length,accounts:accounts.length,followersMeasured:snapshots.filter(s=>s[0]?.followers!=null).length,followers:snapshots.some(s=>s[0]?.followers!=null)?snapshots.reduce((n,s)=>n+(s[0]?.followers??0),0):null,postRecords:posts.length,published:published.length,drafts:posts.filter(p=>p.status==="draft").length,viewsMeasured:published.filter(p=>p.views!=null).length,likesMeasured:published.filter(p=>p.likes!=null).length,accountCoverage:accounts.map(a=>({platform:a.platform,handle:a.handle,published:published.filter(p=>p.account_id===a.id).length,viewsMeasured:published.filter(p=>p.account_id===a.id&&p.views!=null).length}))};
  return Response.json({answer:output.answer,review:output.review,revisionStatus:output.revisionStatus,planningStatus:output.planningStatus,proposals:output.proposals,steps:output.steps,evidenceSummary,mode,accounts:accounts.length,provider:"local Ollama",model:process.env.OLLAMA_MODEL||"qwen3:4b"});
- }catch(error){if(error instanceof Error&&error.message.startsWith("PLAN_INVALID:"))return Response.json({error:"The planner could not produce a valid, nonduplicate plan. "+error.message.slice(14,220)},{status:422});if(error instanceof Error&&error.message==="INCOMPLETE_MODEL_OUTPUT")return Response.json({error:"The local model did not finish its report. Try a shorter request or fewer posts. No incomplete plan was accepted."},{status:422});return Response.json({error:"Analysis failed. Verify Ollama is running, the model is downloaded, and Supabase is reachable."},{status:503});}
+ }catch(error){if(error instanceof Error&&error.message.startsWith("PLAN_INVALID:"))return Response.json({error:"No valid content plan was generated. "+error.message.slice(14,220)},{status:422});if(error instanceof Error&&error.message==="INCOMPLETE_MODEL_OUTPUT")return Response.json({error:"The local model did not finish its report. Try a shorter request or fewer posts. No incomplete plan was accepted."},{status:422});return Response.json({error:"Analysis failed. Verify Ollama is running, the model is downloaded, and Supabase is reachable."},{status:503});}
 }
