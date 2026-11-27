@@ -1,69 +1,28 @@
-import Image from "next/image";
-
-export default function Home() {
-  return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
-  );
+"use client";
+import {useState,type FormEvent} from "react";
+type Brand={id:string;name:string;niche:string;audience:string;identity:{color?:string;tone?:string};status:string;monthly_budget_cents:number};
+type Item={id:string;brand_id:string;title:string;format:string;status:string;script:string};
+const url=process.env.NEXT_PUBLIC_SUPABASE_URL;
+const key=process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+async function api(path:string,token?:string,method="GET",body?:unknown){
+ if(!url||!key)throw new Error("Configure Supabase in dashboard/.env.local.");
+ const r=await fetch(url+path,{method,headers:{apikey:key,Authorization:"Bearer "+(token||key),"Content-Type":"application/json",Prefer:"return=representation"},body:body===undefined?undefined:JSON.stringify(body),cache:"no-store"});
+ if(!r.ok)throw new Error("Request failed ("+r.status+"). Check credentials or input.");
+ return r.json();
+}
+export default function Home(){
+ const [token,setToken]=useState("");
+ const [brands,setBrands]=useState<Brand[]>([]);
+ const [items,setItems]=useState<Item[]>([]);
+ const [selected,setSelected]=useState("");
+ const [tab,setTab]=useState("Overview");
+ const [message,setMessage]=useState("");
+ const [busy,setBusy]=useState(false);
+ async function load(t:string){const [b,i]=await Promise.all([api("/rest/v1/brands?select=*&order=created_at.desc",t),api("/rest/v1/content_items?select=*&order=created_at.desc",t)]);setBrands(b);setItems(i);setSelected(old=>b.some((x:Brand)=>x.id===old)?old:b[0]?.id||"");}
+ async function run(work:()=>Promise<void>){setBusy(true);setMessage("");try{await work()}catch(e){setMessage(e instanceof Error?e.message:"Unexpected error.")}finally{setBusy(false)}}
+ function login(e:FormEvent<HTMLFormElement>){e.preventDefault();const d=new FormData(e.currentTarget);void run(async()=>{const s=await api("/auth/v1/token?grant_type=password",undefined,"POST",{email:d.get("email"),password:d.get("password")});await load(s.access_token);setToken(s.access_token)})}
+ function createBrand(e:FormEvent<HTMLFormElement>){e.preventDefault();const f=e.currentTarget,d=new FormData(f);void run(async()=>{await api("/rest/v1/brands",token,"POST",{name:d.get("name"),niche:d.get("niche"),audience:d.get("audience"),monthly_budget_cents:Math.round(Number(d.get("budget"))*100),identity:{color:d.get("color"),tone:d.get("tone")}});await load(token);f.reset();setMessage("Brand created.")})}
+ function createItem(e:FormEvent<HTMLFormElement>){e.preventDefault();const f=e.currentTarget,d=new FormData(f);void run(async()=>{await api("/rest/v1/content_items",token,"POST",{brand_id:selected,title:d.get("title"),format:d.get("format"),script:d.get("script")});await load(token);f.reset()})}
+ async function change(table:string,id:string,status:string){await run(async()=>{await api("/rest/v1/"+table+"?id=eq."+id,token,"PATCH",{status});await load(token)})}
+ return <main className="shell"><aside><div className="logo">ME<span>.</span></div><p className="muted">MEDIA ENGINE / 01</p><nav>{["Overview","Brand Studio","Content Factory","Integrations"].map(t=><button key={t} className={tab===t?"active":""} onClick={()=>setTab(t)}>{t}</button>)}</nav><small>Private media workspace</small></aside><section className="workspace"><header><div><p className="eyebrow">NETWORK CONTROL / FOUNDATION</p><h1>{tab}</h1></div>{token&&<button disabled={busy} onClick={()=>{setToken("");setBrands([]);setItems([]);setSelected("");setMessage("")}}>Sign out</button>}</header>{message&&<p role="status" className="notice">{message}</p>}{!token?<section className="panel login"><h2>Sign in to your workspace</h2><p>Use an account created in Supabase Authentication. Reloading ends the local session.</p><form onSubmit={login}><label>Email<input name="email" type="email" required/></label><label>Password<input name="password" type="password" required/></label><button className="primary" disabled={busy}>Sign in</button></form>{(!url||!key)&&<p className="notice">Supabase environment configuration missing.</p>}</section>:<><div className="metrics">{[["Brands",brands.length],["Active",brands.filter(b=>b.status==="active").length],["Content",items.length],["Approved",items.filter(i=>i.status==="approved").length]].map(([n,v])=><div className="panel" key={n}><p className="muted">{n}</p><strong>{v}</strong></div>)}</div>{(tab==="Overview"||tab==="Brand Studio")&&<div className="columns"><section className="panel"><h2>Your brands</h2>{!brands.length&&<p>No brands yet. Create your first one.</p>}{brands.map(b=><div className="brand" key={b.id}><button onClick={()=>{setSelected(b.id);setTab("Content Factory")}}><span className="dot" style={{background:b.identity.color||"#94a3b8"}}/>{b.name}</button><p>{b.niche} · {b.audience}</p><small>CAD {(b.monthly_budget_cents/100).toFixed(2)} monthly budget (planning only)</small><select aria-label={"Status for "+b.name} value={b.status} disabled={busy} onChange={e=>void change("brands",b.id,e.target.value)}>{["draft","active","paused","archived"].map(s=><option key={s}>{s}</option>)}</select></div>)}</section><section className="panel"><h2>Create brand</h2><form onSubmit={createBrand}><label>Name<input name="name" required maxLength={100}/></label><label>Niche<input name="niche"/></label><label>Audience<input name="audience"/></label><label>Personality<input name="tone"/></label><label>Colour<input name="color" type="color" defaultValue="#75e1b5"/></label><label>Monthly budget (CAD)<input name="budget" type="number" min="0" max="1000000" step=".01" defaultValue="0" required/></label><button className="primary" disabled={busy}>Create brand</button></form></section></div>}{tab==="Content Factory"&&<section className="panel"><h2>Content pipeline</h2><label>Brand<select value={selected} onChange={e=>setSelected(e.target.value)}>{brands.map(b=><option key={b.id} value={b.id}>{b.name}</option>)}</select></label>{selected?<><form onSubmit={createItem}><label>Title<input name="title" required maxLength={200}/></label><label>Format<select name="format">{["carousel","short_video","image","article"].map(f=><option key={f}>{f}</option>)}</select></label><label>Script / notes<textarea name="script"/></label><button className="primary" disabled={busy}>Add idea</button></form>{items.filter(i=>i.brand_id===selected).map(i=><div className="brand" key={i.id}><b>{i.title}</b><p>{i.format}</p><select aria-label={"Stage for "+i.title} disabled={busy} value={i.status} onChange={e=>void change("content_items",i.id,e.target.value)}>{["idea","script","review","approved","archived"].map(s=><option key={s}>{s}</option>)}</select></div>)}</>:<p>Create a brand first.</p>}</section>}{tab==="Integrations"&&<section className="panel"><h2>Integration status</h2><p>Supabase: signed in</p><p>n8n: workflow connection pending</p><p>AI providers and publishing: not connected.</p><p>No automated paid calls or publishing enabled.</p></section>}</>}</section></main>
 }
