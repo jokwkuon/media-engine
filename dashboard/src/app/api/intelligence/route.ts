@@ -13,11 +13,24 @@ type Proposal={accountId:string;title:string;format:string;plannedDate:string;ho
 const formats=new Set(["short_video","carousel","image","text","article"]);
 const State=Annotation.Root({question:Annotation<string>(),mode:Annotation<Mode>(),context:Annotation<Context>(),evidence:Annotation<string>(),answer:Annotation<string>(),review:Annotation<string>(),revisionAttempted:Annotation<boolean>(),revisionStatus:Annotation<string>(),planningStatus:Annotation<string>(),proposals:Annotation<Proposal[]>(),steps:Annotation<Step[]>()});
 function brief(value:string|null|undefined,max=120){return (value??"").slice(0,max)}
-async function ask(system:string,payload:unknown,json=false){
- const model=new ChatOllama({baseUrl:"http://127.0.0.1:11434",model:process.env.OLLAMA_MODEL||"qwen3:4b",temperature:0.2,maxRetries:0,numPredict:2200,numCtx:8192,think:false});
- const result=await model.invoke([new SystemMessage(system+(json?" Return a JSON array without code fences, followed by a newline and END_OF_REPORT.":" Use plain text, short labeled lines, and no Markdown syntax.")+" Finish every item. End your response with the exact standalone marker END_OF_REPORT."),new HumanMessage(JSON.stringify(payload))],{signal:AbortSignal.timeout(180000)});
+const proposalFields=["accountId","title","format","plannedDate","hook","outline","cta","metric"] as const;
+const fieldLimit=(k:typeof proposalFields[number])=>k==="title"?200:k==="outline"?900:400;
+function proposalSchema(context:Context,count:number){
+ const properties=Object.fromEntries(proposalFields.map(k=>[k,{type:"string",minLength:1,maxLength:fieldLimit(k)}]));
+ return {type:"object",additionalProperties:false,required:["proposals"],properties:{proposals:{type:"array",minItems:count,maxItems:count,items:{type:"object",additionalProperties:false,required:[...proposalFields],properties:{...properties,accountId:{type:"string",enum:context.accounts.map(a=>a.id)},format:{type:"string",enum:[...formats]},plannedDate:{type:"string",pattern:"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}}}}}};
+}
+async function ask(system:string,payload:unknown,schema?:ReturnType<typeof proposalSchema>){
+ const model=new ChatOllama({baseUrl:"http://127.0.0.1:11434",model:process.env.OLLAMA_MODEL||"qwen3:4b",temperature:0.2,maxRetries:0,numPredict:schema?3000:2200,numCtx:8192,think:false,...(schema?{format:schema}:{})});
+ const instruction=schema?" Return only a JSON object containing the proposals array. Every proposal must include all eight required fields. Do not append a marker or Markdown. Keep titles under 90 characters, hooks under 150, outlines under 400, CTAs under 120, and metrics under 80.":" Use plain text, short labeled lines, and no Markdown syntax. Finish every item. End your response with the exact standalone marker END_OF_REPORT.";
+ const result=await model.invoke([new SystemMessage(system+instruction),new HumanMessage(JSON.stringify(payload))],{signal:AbortSignal.timeout(180000)});
  const answer=typeof result.content==="string"?result.content:result.content.filter(x=>x.type==="text").map(x=>"text" in x?x.text:"").join("\n");
- if(result.response_metadata?.done_reason==="length"||!answer.trimEnd().endsWith("END_OF_REPORT"))throw new Error("INCOMPLETE_MODEL_OUTPUT");
+ if(result.response_metadata?.done_reason==="length"||!answer.trim())throw new Error("INCOMPLETE_MODEL_OUTPUT");
+ if(schema){
+  const parsed:unknown=JSON.parse(answer);
+  if(!parsed||typeof parsed!=="object"||!("proposals" in parsed)||!Array.isArray(parsed.proposals))throw Error("PLAN_INVALID: Expected a proposals array.");
+  return JSON.stringify(parsed.proposals);
+ }
+ if(!answer.trimEnd().endsWith("END_OF_REPORT"))throw new Error("INCOMPLETE_MODEL_OUTPUT");
  const complete=answer.trimEnd().slice(0,-"END_OF_REPORT".length).trim();
  if(!complete)throw Error("INCOMPLETE_MODEL_OUTPUT");
  return complete;
@@ -37,8 +50,9 @@ function validatePlan(raw:string,context:Context,expected:number,accepted:Propos
  for(const entry of data){
  if(!entry||typeof entry!=="object")throw Error("PLAN_INVALID: Invalid proposal.");
  const p=entry as Record<string,unknown>;
- const fields=["accountId","title","format","plannedDate","hook","outline","cta","metric"] as const;
- if(fields.some(k=>typeof p[k]!=="string"||!String(p[k]).trim()||String(p[k]).length>(k==="title"?200:k==="outline"?900:400)))throw Error("PLAN_INVALID: Missing or oversized proposal fields.");
+ const fields=proposalFields;
+ const invalid=fields.filter(k=>typeof p[k]!=="string"||!String(p[k]).trim()||String(p[k]).trim().length>fieldLimit(k));
+ if(invalid.length)throw Error("PLAN_INVALID: Invalid fields: "+invalid.map(k=>k+" ("+(typeof p[k]!=="string"?"missing or non-text":!String(p[k]).trim()?"empty":"over "+fieldLimit(k)+" characters")+")").join(", "));
  const q=Object.fromEntries(fields.map(k=>[k,String(p[k]).trim()])) as Proposal;
  if(!context.accounts.some(a=>a.id===q.accountId)||!formats.has(q.format))throw Error("PLAN_INVALID: Unknown account or format.");
  if(!/^\d{4}-\d{2}-\d{2}$/.test(q.plannedDate)||!Number.isFinite(Date.parse(q.plannedDate))||new Date(q.plannedDate).toISOString().slice(0,10)!==q.plannedDate)throw Error("PLAN_INVALID: Invalid planned date.");
@@ -70,17 +84,18 @@ const graph=new StateGraph(State)
  const expected=requested?(({one:1,two:2,three:3,four:4,five:5} as Record<string,number>)[requested]||Number(requested)):5;
  const existingTitles=s.context.posts.filter(p=>p.status!=="cancelled").map(p=>brief(p.title,200));
  const evidence=JSON.parse(s.evidence);
+ const compactEvidence={...evidence,accounts:evidence.accounts.map((a:Record<string,unknown>)=>({...a,snapshot:undefined}))};
  const proposals:Proposal[]=[];
  const rejected:string[]=[];
  const attempts:Step[]=[];
  for(let attempt=0;attempt<3&&proposals.length<expected;attempt++){
- const batchStart=Date.now(),remaining=expected-proposals.length;
- const prompt=guard+"You are a content planner. Return exactly "+remaining+" NEW proposals as a JSON array. Do not return the accepted proposals again. Existing titles, accepted titles, and rejected titles are exclusions, not suggestions. Invent different creative scenarios, not just alternate wording. Each object must have string fields accountId (copy an exact ID from evidence.accounts), title, format (short_video, carousel, image, text, article), plannedDate (YYYY-MM-DD), hook, outline, cta, metric. Each hook must open on specific tension, a visual event or a relatable moment. Each outline must specify three beats for videos or a concrete text/carousel structure. Match CTA to metric. Repeated KPIs are allowed. Follow account styles. Use competitor research for inspiration only. Do not claim public app availability if the campaign is for a waitlist. No automatic scheduling.";
+ const batchStart=Date.now(),remaining=Math.min(3,expected-proposals.length);
+ const prompt=guard+"You are a content planner. Return exactly "+remaining+" NEW proposals inside the proposals array. Do not return the accepted proposals again. Existing titles, accepted titles, and rejected titles are exclusions, not suggestions. Invent different creative scenarios, not just alternate wording. Each object must have string fields accountId (copy an exact ID from evidence.accounts), title, format (short_video, carousel, image, text, article), plannedDate (YYYY-MM-DD), hook, outline, cta, metric. Each hook must open on specific tension, a visual event or a relatable moment. Each outline must specify three beats for videos or a concrete text/carousel structure. Match CTA to metric. Repeated KPIs are allowed. Follow account styles. Use competitor research for inspiration only. Do not claim public app availability if the campaign is for a waitlist. No automatic scheduling.";
  let batch:unknown;
  try{
- const raw=await ask(prompt,{question:s.question,evidence,requestedCount:remaining,excludedExistingTitles:existingTitles,excludedAcceptedTitles:proposals.map(p=>p.title),rejectedFeedback:rejected.slice(-12)},true);
+ const raw=await ask(prompt,{question:s.question,evidence:compactEvidence,requestedCount:remaining,excludedExistingTitles:existingTitles,excludedAcceptedTitles:proposals.map(p=>p.title),rejectedFeedback:rejected.slice(-12)},proposalSchema(s.context,remaining));
  batch=JSON.parse(raw);
- }catch(e){if(e instanceof SyntaxError||e instanceof Error&&e.message==="INCOMPLETE_MODEL_OUTPUT"){rejected.push("The previous response was not a complete JSON array.");attempts.push({name:"Planner attempt "+(attempt+1)+" — incomplete response",durationMs:Date.now()-batchStart});continue}throw e;}
+ }catch(e){if(e instanceof SyntaxError||e instanceof Error&&(e.message==="INCOMPLETE_MODEL_OUTPUT"||e.message.startsWith("PLAN_INVALID:"))){rejected.push("The previous response was not a complete JSON array.");attempts.push({name:"Planner attempt "+(attempt+1)+" — incomplete response",durationMs:Date.now()-batchStart});continue}throw e;}
  if(!Array.isArray(batch)){rejected.push("Expected a JSON array.");attempts.push({name:"Planner attempt "+(attempt+1)+" — invalid response",durationMs:Date.now()-batchStart});continue;}
  let count=0;
  for(const entry of batch.slice(0,10)){
@@ -102,8 +117,8 @@ const graph=new StateGraph(State)
  .addNode("revise",async(s)=>{
  const t=Date.now();
  try{
- const prompt=guard+"You are the creative director. Revise the supplied proposals to resolve material review findings while keeping the original requested scope and count. Retain account IDs and dates unless a correction requires a change. Return exactly "+s.proposals.length+" JSON objects with the same string fields accountId,title,format,plannedDate,hook,outline,cta,metric. Make the opening visual and specific, provide three concrete beats or a text/carousel structure, and ensure the CTA and metric match. Avoid generic marketing language and unsupported product claims. Do not copy competitor captions or scripts. Reuse KPIs where sensible. All proposals are drafts.";
- const raw=await ask(prompt,{question:s.question,evidence:JSON.parse(s.evidence),proposals:s.proposals,feedback:s.review},true);
+ const prompt=guard+"You are the creative director. Revise the supplied proposals to resolve material review findings while keeping the original requested scope and count. Retain account IDs and dates unless a correction requires a change. Return exactly "+s.proposals.length+" objects inside the proposals array with the same string fields accountId,title,format,plannedDate,hook,outline,cta,metric. Make the opening visual and specific, provide three concrete beats or a text/carousel structure, and ensure the CTA and metric match. Avoid generic marketing language and unsupported product claims. Do not copy competitor captions or scripts. Reuse KPIs where sensible. All proposals are drafts.";
+ const raw=await ask(prompt,{question:s.question,evidence:JSON.parse(s.evidence),proposals:s.proposals,feedback:s.review},proposalSchema(s.context,s.proposals.length));
  const proposals=validatePlan(raw,s.context,s.proposals.length);
  const answer=proposals.map((p,i)=>{const a=s.context.accounts.find(a=>a.id===p.accountId);return [String(i+1)+". "+p.title,"Account: "+a?.platform+" @"+a?.handle,"Date: "+p.plannedDate,"Format: "+p.format,"Hook: "+p.hook,"Outline: "+p.outline,"CTA: "+p.cta,"Metric: "+p.metric].join("\n")}).join("\n\n");
  return {proposals,answer,revisionAttempted:true,revisionStatus:"Revised proposals passed structural validation; final human review is still required.",steps:[...s.steps,{name:"Creative revision + deterministic validation",durationMs:Date.now()-t}]};
@@ -132,6 +147,7 @@ export async function POST(req:Request){
  const brands=await read<Brand[]>("/rest/v1/brands?select=id,name,niche,audience,identity"+(filter==="all"?"":"&id=eq."+filter)+"&limit=100");
  if(filter!=="all"&&!brands.length)return Response.json({error:"Brand not found."},{status:404});
  const accounts=await read<Account[]>("/rest/v1/social_accounts?select=id,brand_id,platform,handle,retrieval_status,content_style,content_goal"+(filter==="all"?"":"&brand_id=eq."+filter)+"&limit=100");
+ if(mode==="planning"&&!accounts.length)return Response.json({error:"Add a social account to this brand before planning content."},{status:422});
  const snapshots=await Promise.all(accounts.map(a=>read<Snapshot[]>("/rest/v1/account_snapshots?select=account_id,observed_at,source,followers,published_count,lifetime_views&account_id=eq."+a.id+"&order=observed_at.desc,id.desc&limit=1")));
  const posts=accounts.length?await read<Post[]>("/rest/v1/marketing_posts?select=account_id,title,format,campaign,status,planned_date,views,likes,comments,shares,saves,follows,clicks,conversions,metrics_observed_at&account_id=in.("+accounts.map(a=>a.id).join(",")+")&order=created_at.desc&limit=100"):[];
  const competitors=await read<Competitor[]>("/rest/v1/competitor_observations?select=competitor,platform,post_url,caption,views,likes,saves,outlier_multiple,outlier_metric,observed_at,source"+(filter==="all"?"":"&brand_id=eq."+filter)+"&order=observed_at.desc,id.asc&limit=30");
