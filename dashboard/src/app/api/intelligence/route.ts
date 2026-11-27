@@ -11,7 +11,7 @@ type Mode="analysis"|"planning";
 type Step={name:string;durationMs:number};
 type Proposal={accountId:string;title:string;format:string;plannedDate:string;hook:string;outline:string;cta:string;metric:string};
 const formats=new Set(["short_video","carousel","image","text","article"]);
-const State=Annotation.Root({question:Annotation<string>(),mode:Annotation<Mode>(),context:Annotation<Context>(),evidence:Annotation<string>(),answer:Annotation<string>(),review:Annotation<string>(),revisionAttempted:Annotation<boolean>(),revisionStatus:Annotation<string>(),proposals:Annotation<Proposal[]>(),steps:Annotation<Step[]>()});
+const State=Annotation.Root({question:Annotation<string>(),mode:Annotation<Mode>(),context:Annotation<Context>(),evidence:Annotation<string>(),answer:Annotation<string>(),review:Annotation<string>(),revisionAttempted:Annotation<boolean>(),revisionStatus:Annotation<string>(),planningStatus:Annotation<string>(),proposals:Annotation<Proposal[]>(),steps:Annotation<Step[]>()});
 function brief(value:string|null|undefined,max=120){return (value??"").slice(0,max)}
 async function ask(system:string,payload:unknown,json=false){
  const model=new ChatOllama({baseUrl:"http://127.0.0.1:11434",model:process.env.OLLAMA_MODEL||"qwen3:4b",temperature:0.2,maxRetries:0,numPredict:2200,numCtx:8192,think:false});
@@ -29,10 +29,10 @@ function similarTitle(a:string,b:string){
  const overlap=[...xs].filter(w=>ys.has(w)).length;
  return overlap/new Set([...xs,...ys]).size>=0.8;
 }
-function validatePlan(raw:string,context:Context,expected:number):Proposal[]{
+function validatePlan(raw:string,context:Context,expected:number,accepted:Proposal[]=[]):Proposal[]{
  let data:unknown;try{data=JSON.parse(raw)}catch{throw Error("PLAN_INVALID: Expected a JSON array.")}
  if(!Array.isArray(data)||data.length!==expected)throw Error("PLAN_INVALID: Expected "+expected+" complete proposals.");
- const prior=context.posts.filter(p=>p.status!=="cancelled").map(p=>p.title);
+ const prior=[...context.posts.filter(p=>p.status!=="cancelled").map(p=>p.title),...accepted.map(p=>p.title)];
  const out:Proposal[]=[];
  for(const entry of data){
  if(!entry||typeof entry!=="object")throw Error("PLAN_INVALID: Invalid proposal.");
@@ -42,7 +42,9 @@ function validatePlan(raw:string,context:Context,expected:number):Proposal[]{
  const q=Object.fromEntries(fields.map(k=>[k,String(p[k]).trim()])) as Proposal;
  if(!context.accounts.some(a=>a.id===q.accountId)||!formats.has(q.format))throw Error("PLAN_INVALID: Unknown account or format.");
  if(!/^\d{4}-\d{2}-\d{2}$/.test(q.plannedDate)||!Number.isFinite(Date.parse(q.plannedDate))||new Date(q.plannedDate).toISOString().slice(0,10)!==q.plannedDate)throw Error("PLAN_INVALID: Invalid planned date.");
- if(prior.some(t=>similarTitle(t,q.title))||out.some(t=>similarTitle(t.title,q.title)))throw Error("PLAN_INVALID: Duplicate title: "+q.title);
+ if(!normalizeTitle(q.title))throw Error("PLAN_INVALID: Empty normalized title.");
+ const duplicate=[...prior,...out.map(p=>p.title)].find(t=>similarTitle(t,q.title));
+ if(duplicate)throw Error("PLAN_INVALID: Duplicate title: "+q.title+" conflicts with "+duplicate);
  out.push(q);
  }
  return out;
@@ -66,15 +68,32 @@ const graph=new StateGraph(State)
  const t=Date.now();
  const requested=s.question.match(/\b([1-5]|one|two|three|four|five)\s+(?:original\s+)?(?:content\s+)?(?:ideas|posts|proposals)\b/i)?.[1]?.toLowerCase();
  const expected=requested?(({one:1,two:2,three:3,four:4,five:5} as Record<string,number>)[requested]||Number(requested)):5;
- const payload={question:s.question,evidence:JSON.parse(s.evidence),expectedCount:expected,existingTitles:s.context.posts.filter(p=>p.status!=="cancelled").slice(0,100).map(p=>brief(p.title,100))};
- const prompt=guard+"You are a content planner. Return exactly "+expected+" original proposals as a JSON array. Each object has string fields accountId (copy an exact ID from evidence.accounts), title, format (short_video, carousel, image, text, article), plannedDate (YYYY-MM-DD), hook, outline (short creative direction), cta, metric (metric to measure, not a forecast). Keep proposals concise but production-ready. Each hook must open on a specific tension, visual event, counterintuitive fact supported by evidence, or relatable moment; avoid generic statements like tracking is important. Each outline must contain a concrete sequence of 3 beats (opening, demonstration or payoff, ending) for videos or a specific structure for text and carousels. Choose a CTA that actually matches the goal and metric. Repeat a metric or CTA if appropriate for a controlled test. Use account-specific styles and avoid existing titles. Use competitor evidence for inspiration only; create original concepts, do not copy captions or scripts. If the question mentions the waitlist, do not claim the app is publicly available. No automatic scheduling.";
- let proposals:Proposal[]=[];let correction="";
- for(let attempt=0;attempt<2;attempt++){
- try{const raw=await ask(prompt,{...payload,correction},true);proposals=validatePlan(raw,s.context,expected);break}
- catch(e){if(!(e instanceof Error)||!e.message.startsWith("PLAN_INVALID:"))throw e;correction=e.message;if(attempt===1)throw e;}
+ const existingTitles=s.context.posts.filter(p=>p.status!=="cancelled").map(p=>brief(p.title,200));
+ const evidence=JSON.parse(s.evidence);
+ const proposals:Proposal[]=[];
+ const rejected:string[]=[];
+ const attempts:Step[]=[];
+ for(let attempt=0;attempt<3&&proposals.length<expected;attempt++){
+ const batchStart=Date.now(),remaining=expected-proposals.length;
+ const prompt=guard+"You are a content planner. Return exactly "+remaining+" NEW proposals as a JSON array. Do not return the accepted proposals again. Existing titles, accepted titles, and rejected titles are exclusions, not suggestions. Invent different creative scenarios, not just alternate wording. Each object must have string fields accountId (copy an exact ID from evidence.accounts), title, format (short_video, carousel, image, text, article), plannedDate (YYYY-MM-DD), hook, outline, cta, metric. Each hook must open on specific tension, a visual event or a relatable moment. Each outline must specify three beats for videos or a concrete text/carousel structure. Match CTA to metric. Repeated KPIs are allowed. Follow account styles. Use competitor research for inspiration only. Do not claim public app availability if the campaign is for a waitlist. No automatic scheduling.";
+ let batch:unknown;
+ try{
+ const raw=await ask(prompt,{question:s.question,evidence,requestedCount:remaining,excludedExistingTitles:existingTitles,excludedAcceptedTitles:proposals.map(p=>p.title),rejectedFeedback:rejected.slice(-12)},true);
+ batch=JSON.parse(raw);
+ }catch(e){if(e instanceof SyntaxError||e instanceof Error&&e.message==="INCOMPLETE_MODEL_OUTPUT"){rejected.push("The previous response was not a complete JSON array.");attempts.push({name:"Planner attempt "+(attempt+1)+" — incomplete response",durationMs:Date.now()-batchStart});continue}throw e;}
+ if(!Array.isArray(batch)){rejected.push("Expected a JSON array.");attempts.push({name:"Planner attempt "+(attempt+1)+" — invalid response",durationMs:Date.now()-batchStart});continue;}
+ let count=0;
+ for(const entry of batch.slice(0,10)){
+ if(proposals.length>=expected)break;
+ try{const [p]=validatePlan(JSON.stringify([entry]),s.context,1,proposals);proposals.push(p);count++;}
+ catch(e){if(e instanceof Error&&e.message.startsWith("PLAN_INVALID:"))rejected.push(e.message.slice(0,420));else throw e;}
  }
+ attempts.push({name:"Planner attempt "+(attempt+1)+" — "+count+" new valid proposal(s)",durationMs:Date.now()-batchStart});
+ }
+ if(!proposals.length)throw Error("PLAN_INVALID: No valid proposals after three attempts. "+(rejected.at(-1)||"Try a narrower request."));
+ const planningStatus=proposals.length<expected?"Partial plan: "+proposals.length+" of "+expected+" requested proposals passed validation after three attempts. Rejected ideas were not included.":"All "+expected+" requested proposals passed structural and title validation.";
  const answer=proposals.map((p,i)=>{const a=s.context.accounts.find(a=>a.id===p.accountId);return [String(i+1)+". "+p.title,"Account: "+a?.platform+" @"+a?.handle,"Date: "+p.plannedDate,"Format: "+p.format,"Hook: "+p.hook,"Outline: "+p.outline,"CTA: "+p.cta,"Metric: "+p.metric].join("\n")}).join("\n\n");
- return {answer,proposals,steps:[...s.steps,{name:"Content planner + deterministic validation",durationMs:Date.now()-t}]};
+ return {answer,proposals,planningStatus,steps:[...s.steps,...attempts,{name:"Content planner + deterministic validation (total)",durationMs:Date.now()-t}]};
  })
  .addNode("reviewer",async(s)=>{
  const t=Date.now(),review=await ask(guard+"You are a quality reviewer. Review the proposed plan against the stored evidence. Flag unsupported numerical claims, genuinely duplicated creative execution, vague hooks, weak production direction, account mismatch, CTA/metric mismatch, unsafe fitness claims, and misleading product promises. Reusing a topic, KPI or CTA is NOT inherently a flaw; repeated conversion goals can be useful for experiments. Cite specific proposal numbers and distinguish issues from preferences. Do not reproduce the proposal. Start with REVISE if there is a material issue, otherwise PASS. Give at most five short actionable findings. This is advisory, not approval.",{question:s.question,evidence:JSON.parse(s.evidence),proposal:s.answer});
@@ -86,7 +105,7 @@ const graph=new StateGraph(State)
  const prompt=guard+"You are the creative director. Revise the supplied proposals to resolve material review findings while keeping the original requested scope and count. Retain account IDs and dates unless a correction requires a change. Return exactly "+s.proposals.length+" JSON objects with the same string fields accountId,title,format,plannedDate,hook,outline,cta,metric. Make the opening visual and specific, provide three concrete beats or a text/carousel structure, and ensure the CTA and metric match. Avoid generic marketing language and unsupported product claims. Do not copy competitor captions or scripts. Reuse KPIs where sensible. All proposals are drafts.";
  const raw=await ask(prompt,{question:s.question,evidence:JSON.parse(s.evidence),proposals:s.proposals,feedback:s.review},true);
  const proposals=validatePlan(raw,s.context,s.proposals.length);
- const answer=proposals.map((p,i)=>{const a=s.context.accounts.find(a=>a.id===p.accountId);return [String(i+1)+". "+p.title,"Account: "+a?.platform+" @"+a?.handle,"Date: "+p.plannedDate,"Format: "+p.format,"Hook: "+p.hook,"Outline: "+p.outline,"CTA: "+p.cta,"Metric: "+p.metric].join("\\n")}).join("\\n\\n");
+ const answer=proposals.map((p,i)=>{const a=s.context.accounts.find(a=>a.id===p.accountId);return [String(i+1)+". "+p.title,"Account: "+a?.platform+" @"+a?.handle,"Date: "+p.plannedDate,"Format: "+p.format,"Hook: "+p.hook,"Outline: "+p.outline,"CTA: "+p.cta,"Metric: "+p.metric].join("\n")}).join("\n\n");
  return {proposals,answer,revisionAttempted:true,revisionStatus:"Revised proposals passed structural validation; final human review is still required.",steps:[...s.steps,{name:"Creative revision + deterministic validation",durationMs:Date.now()-t}]};
  }catch{
  return {revisionAttempted:true,revisionStatus:"Revision could not be validated. Original proposals retained; address the review findings manually.",steps:[...s.steps,{name:"Revision unsuccessful — original drafts retained",durationMs:Date.now()-t}]};
@@ -117,9 +136,9 @@ export async function POST(req:Request){
  const posts=accounts.length?await read<Post[]>("/rest/v1/marketing_posts?select=account_id,title,format,campaign,status,planned_date,views,likes,comments,shares,saves,follows,clicks,conversions,metrics_observed_at&account_id=in.("+accounts.map(a=>a.id).join(",")+")&order=created_at.desc&limit=100"):[];
  const competitors=await read<Competitor[]>("/rest/v1/competitor_observations?select=competitor,platform,post_url,caption,views,likes,saves,outlier_multiple,outlier_metric,observed_at,source"+(filter==="all"?"":"&brand_id=eq."+filter)+"&order=observed_at.desc,id.asc&limit=30");
  const context={competitors,brands,accounts:accounts.map((a,i)=>({...a,snapshot:snapshots[i][0]??null})),posts};
- const output=await graph.invoke({question:body.question.trim(),mode,context,evidence:"",answer:"",review:"",revisionAttempted:false,revisionStatus:"",proposals:[],steps:[{name:"Supabase data retrieval",durationMs:Date.now()-retrievalStart}]});
+ const output=await graph.invoke({question:body.question.trim(),mode,context,evidence:"",answer:"",review:"",revisionAttempted:false,revisionStatus:"",planningStatus:"",proposals:[],steps:[{name:"Supabase data retrieval",durationMs:Date.now()-retrievalStart}]});
  const published=posts.filter(p=>p.status==="published");
  const evidenceSummary={competitorRecords:competitors.length,competitorRecordsInPrompt:Math.min(12,competitors.length),competitorNames:Array.from(new Set(competitors.map(c=>c.competitor))),brands:brands.length,accounts:accounts.length,followersMeasured:snapshots.filter(s=>s[0]?.followers!=null).length,followers:snapshots.some(s=>s[0]?.followers!=null)?snapshots.reduce((n,s)=>n+(s[0]?.followers??0),0):null,postRecords:posts.length,published:published.length,drafts:posts.filter(p=>p.status==="draft").length,viewsMeasured:published.filter(p=>p.views!=null).length,likesMeasured:published.filter(p=>p.likes!=null).length,accountCoverage:accounts.map(a=>({platform:a.platform,handle:a.handle,published:published.filter(p=>p.account_id===a.id).length,viewsMeasured:published.filter(p=>p.account_id===a.id&&p.views!=null).length}))};
- return Response.json({answer:output.answer,review:output.review,revisionStatus:output.revisionStatus,proposals:output.proposals,steps:output.steps,evidenceSummary,mode,accounts:accounts.length,provider:"local Ollama",model:process.env.OLLAMA_MODEL||"qwen3:4b"});
+ return Response.json({answer:output.answer,review:output.review,revisionStatus:output.revisionStatus,planningStatus:output.planningStatus,proposals:output.proposals,steps:output.steps,evidenceSummary,mode,accounts:accounts.length,provider:"local Ollama",model:process.env.OLLAMA_MODEL||"qwen3:4b"});
  }catch(error){if(error instanceof Error&&error.message.startsWith("PLAN_INVALID:"))return Response.json({error:"The planner could not produce a valid, nonduplicate plan. "+error.message.slice(14,220)},{status:422});if(error instanceof Error&&error.message==="INCOMPLETE_MODEL_OUTPUT")return Response.json({error:"The local model did not finish its report. Try a shorter request or fewer posts. No incomplete plan was accepted."},{status:422});return Response.json({error:"Analysis failed. Verify Ollama is running, the model is downloaded, and Supabase is reachable."},{status:503});}
 }
